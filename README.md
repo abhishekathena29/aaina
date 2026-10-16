@@ -66,6 +66,15 @@ npm i -g firebase-tools && firebase login && firebase use <project-id>
 npm run build && firebase deploy   # hosting + firestore rules/indexes
 ```
 
+### Hosting on Vercel instead
+
+`vercel.json` sends every route (`/orders/…`, `/admin`, …) to `index.html` so React Router can handle it. Real files such as `/assets/*` and `/images/*` are still served directly, with long cache headers. It also sets `Cross-Origin-Opener-Policy: same-origin-allow-popups` so the Google sign-in and Razorpay popups can talk back to the page.
+
+1. Import the repo in Vercel. The framework (Vite), build command and output directory come from `vercel.json`.
+2. Add the `VITE_*` variables from `.env.example` under **Project → Settings → Environment Variables**. Vite bakes them in at build time, so redeploy after changing them.
+3. Add your Vercel domain(s) to **Firebase → Authentication → Settings → Authorized domains**, or Google sign-in will fail.
+4. Firestore rules and indexes still deploy from the Firebase CLI: `firebase deploy --only firestore`.
+
 ## Where things live
 
 - `src/shared/`: pricing, slot rules, order stages, message copy and state transitions, used by both backends. If you change prices, update them in `firestore.rules` too.
