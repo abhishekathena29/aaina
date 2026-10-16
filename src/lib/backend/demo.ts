@@ -4,7 +4,7 @@
 import { isValidSlot, slotKey, type SlotKind } from '../../shared/catalog'
 import * as logic from '../../shared/logic'
 import type { Booking, OutboxMessage } from '../../shared/types'
-import { ADMIN_EMAILS, APP_URL } from '../config'
+import { ADMIN_EMAILS, ADMIN_NOTIFY_EMAIL, APP_URL } from '../config'
 import type { AppUser, Backend } from './types'
 
 interface DB {
@@ -85,18 +85,28 @@ function commit(db: DB, t: logic.Transition) {
     for (const channel of n.channels) {
       const to =
         n.to === 'admin'
-          ? ADMIN_EMAILS[0]
+          ? ADMIN_NOTIFY_EMAIL
           : channel === 'email'
             ? t.booking.customer.email
             : t.booking.customer.phone
-      db.outbox.unshift({ id: uid(), channel, to, subject: n.message.subject, body: n.message.body, bookingId: t.booking.id, at: Date.now() })
+      // As in production, WhatsApp messages wait in the queue for an admin to send them.
+      db.outbox.unshift({
+        id: uid(),
+        channel,
+        to,
+        subject: n.message.subject,
+        body: n.message.body,
+        bookingId: t.booking.id,
+        at: Date.now(),
+        ...(channel === 'whatsapp' ? { status: 'pending' as const } : {}),
+      })
     }
   }
   save(db)
 }
 
-const hasPaidConsultation = (db: DB, userId: string) =>
-  Object.values(db.bookings).some((b) => b.uid === userId && b.product === 'consultation' && b.paymentStatus === 'paid')
+const paidConsultation = (db: DB, userId: string) =>
+  Object.values(db.bookings).find((b) => b.uid === userId && b.product === 'consultation' && b.paymentStatus === 'paid')
 
 const sortNewest = (list: Booking[]) => list.sort((a, b) => b.createdAt - a.createdAt)
 
@@ -131,7 +141,7 @@ export const demoBackend: Backend = {
   },
 
   async hasPaidConsultation() {
-    return hasPaidConsultation(load(), requireUser().uid)
+    return !!paidConsultation(load(), requireUser().uid)
   },
 
   async createBooking({ product, slot, name, phone }) {
@@ -145,7 +155,7 @@ export const demoBackend: Backend = {
       customer: { name: name || user.name, email: user.email, phone },
       product,
       slot,
-      hasPaidConsultation: hasPaidConsultation(db, user.uid),
+      creditBookingId: paidConsultation(db, user.uid)?.id,
       now: Date.now(),
     })
     db.bookings[booking.id] = booking
@@ -209,5 +219,21 @@ export const demoBackend: Backend = {
 
   watchOutbox(cb) {
     return subscribe(() => cb(load().outbox))
+  },
+
+  async markWhatsAppSent(messageId) {
+    requireAdmin()
+    const db = load()
+    const m = db.outbox.find((x) => x.id === messageId)
+    if (m) m.status = 'sent'
+    save(db)
+  },
+
+  async markReminderSent(bookingId, kind) {
+    requireAdmin()
+    const db = load()
+    const b = db.bookings[bookingId]
+    if (b) b.reminders = { ...b.reminders, [kind]: true }
+    save(db)
   },
 }

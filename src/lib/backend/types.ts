@@ -34,4 +34,7 @@ export interface Backend {
   watchAllBookings(cb: (bookings: Booking[]) => void): Unsubscribe
   adminAction(bookingId: string, action: AdminAction): Promise<void>
   watchOutbox(cb: (messages: OutboxMessage[]) => void): Unsubscribe
+  /** Call after the admin has sent a queued WhatsApp message via wa.me. */
+  markWhatsAppSent(messageId: string): Promise<void>
+  markReminderSent(bookingId: string, kind: 'consultation' | 'delivery'): Promise<void>
 }

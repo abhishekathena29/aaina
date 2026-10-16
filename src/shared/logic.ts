@@ -24,13 +24,15 @@ export function createBooking(p: {
   customer: Booking['customer']
   product: ProductId
   slot?: Slot
-  hasPaidConsultation: boolean
+  /** Id of the user's paid consultation booking, if any. */
+  creditBookingId?: string
   now: number
 }): Booking {
+  const hasPaidConsultation = !!p.creditBookingId
   const product = PRODUCTS[p.product]
   if (!product) throw new BookingError('Unknown product')
   if (product.needsConsultationSlot && !p.slot) throw new BookingError('Please choose a consultation slot')
-  if (p.product === 'wig-only' && !p.hasPaidConsultation)
+  if (p.product === 'wig-only' && !hasPaidConsultation)
     throw new BookingError('This option is for customers who have already booked a consultation with us')
   if (!/^\+?\d[\d\s-]{8,15}$/.test(p.customer.phone.trim())) throw new BookingError('Please enter a valid WhatsApp number')
 
@@ -39,7 +41,8 @@ export function createBooking(p: {
     uid: p.uid,
     customer: { ...p.customer, phone: p.customer.phone.trim() },
     product: p.product,
-    amount: priceFor(p.product, p.hasPaidConsultation),
+    amount: priceFor(p.product, hasPaidConsultation),
+    ...(p.creditBookingId && p.product !== 'consultation' && p.product !== 'complete-package' ? { creditBookingId: p.creditBookingId } : {}),
     paymentStatus: 'pending',
     ...(product.needsConsultationSlot && p.slot
       ? { consultation: { ...p.slot, status: 'awaiting-confirmation' as const } }
@@ -73,6 +76,8 @@ export function markPaid(b: Booking, paymentRef: string, appUrl: string, now: nu
 export function applyAdminAction(b: Booking, action: AdminAction, appUrl: string, now: number): Transition {
   if (b.paymentStatus !== 'paid') throw new BookingError('Booking is not paid yet')
   switch (action.type) {
+    case 'verify-payment':
+      return { booking: { ...b, paymentVerified: true }, notify: [] }
     case 'confirm-consultation': {
       if (!b.consultation) throw new BookingError('No consultation on this booking')
       const booking: Booking = {

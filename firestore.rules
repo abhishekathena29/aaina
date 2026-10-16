@@ -1,6 +1,9 @@
 rules_version = '2';
-// Clients may only READ. Every write goes through Cloud Functions (functions/src/index.ts),
-// which validate prices, slots and payments server-side.
+// There is no server: the web app writes to Firestore directly (src/lib/backend/firebase.ts), and
+// these rules are the only thing that stops a tampered client. They check prices, slot ownership and
+// which fields each state change may touch.
+// Payments cannot be verified without a server, so a customer could mark their own booking "paid".
+// Admins verify every payment id in the Razorpay dashboard (Admin → "Mark payment verified").
 service cloud.firestore {
   match /databases/{database}/documents {
     function signedIn() { return request.auth != null; }
@@ -8,20 +11,173 @@ service cloud.firestore {
       return signedIn() && request.auth.token.email_verified == true
         && exists(/databases/$(database)/documents/admins/$(request.auth.token.email));
     }
+    function now() { return request.time.toMillis(); }
+    function bookingAfter(id) { return getAfter(/databases/$(database)/documents/bookings/$(id)).data; }
+    function slotAfter(kind, date, time) {
+      return getAfter(/databases/$(database)/documents/slots/$(kind + '_' + date + '_' + time)).data;
+    }
+    function changed() { return request.resource.data.diff(resource.data).affectedKeys(); }
+    /** The timeline can only grow; existing entries can't be rewritten. */
+    function timelineAppended(o, n) {
+      return n.timeline.size() > o.timeline.size() && n.timeline.hasAll(o.timeline);
+    }
+
+    // ---------- bookings ----------
+
+    // Prices: keep in sync with src/shared/catalog.ts (CONSULTATION_PRICE = 499, WIG_PRICE = 14999).
+    function hasCredit(b) {
+      let c = get(/databases/$(database)/documents/bookings/$(b.creditBookingId)).data;
+      return c.uid == request.auth.uid && c.product == 'consultation' && c.paymentStatus == 'paid';
+    }
+    function priceOk(b) {
+      return (b.product == 'consultation' && b.amount == 499 && !('creditBookingId' in b))
+        || (b.product == 'complete-package' && b.amount == 14999 && !('creditBookingId' in b))
+        || (b.product == 'wig-only' && b.amount == 14500 && hasCredit(b))
+        || (b.product == 'natural-wig' && b.amount == 14999 && !('creditBookingId' in b))
+        || (b.product == 'natural-wig' && b.amount == 14500 && hasCredit(b));
+    }
+    function newSlotOk(id, b) {
+      return b.product in ['consultation', 'complete-package']
+        ? b.consultation.keys().hasOnly(['date', 'time', 'status'])
+          && b.consultation.status == 'awaiting-confirmation'
+          && slotAfter('consultation', b.consultation.date, b.consultation.time).bookingId == id
+        : !('consultation' in b);
+    }
+    function newDeliveryOk(b) {
+      return b.product == 'consultation' ? !('delivery' in b) : b.delivery == { 'enabled': false };
+    }
+    function validNewBooking(id) {
+      let b = request.resource.data;
+      return signedIn()
+        && b.keys().hasOnly(['id', 'uid', 'customer', 'product', 'amount', 'paymentStatus', 'consultation',
+                             'delivery', 'stage', 'timeline', 'createdAt', 'holdUntil', 'creditBookingId'])
+        && b.id == id && b.uid == request.auth.uid
+        && b.customer.keys().hasOnly(['name', 'email', 'phone'])
+        && b.customer.email == request.auth.token.email
+        && b.customer.name is string && b.customer.name.size() <= 80
+        && b.customer.phone is string && b.customer.phone.size() <= 20
+        && b.paymentStatus == 'pending' && b.stage == 'pending-payment' && b.timeline.size() == 0
+        && b.createdAt is int && b.holdUntil == b.createdAt + 15 * 60000
+        && b.holdUntil <= now() + 30 * 60000 // allows some client clock skew
+        && priceOk(b) && newSlotOk(id, b) && newDeliveryOk(b);
+    }
+
+    // Customer pays: pending → paid. The consultation slot must be booked in the same transaction,
+    // unless the hold expired and the booking was moved to "reschedule-requested".
+    function payUpdate(id) {
+      let o = resource.data;
+      let n = request.resource.data;
+      return o.paymentStatus == 'pending' && n.paymentStatus == 'paid'
+        && changed().hasOnly(['paymentStatus', 'paymentRef', 'paidAt', 'stage', 'timeline', 'holdUntil', 'consultation'])
+        && n.paymentRef is string && n.paymentRef.matches('pay_[A-Za-z0-9]+')
+        && n.stage in ['paid', 'awaiting-confirmation'] && !('holdUntil' in n)
+        && timelineAppended(o, n)
+        && (!('consultation' in o) || (
+          n.consultation.date == o.consultation.date && n.consultation.time == o.consultation.time
+          && (n.consultation.status == 'reschedule-requested'
+            || (n.consultation.status == 'awaiting-confirmation'
+              && slotAfter('consultation', o.consultation.date, o.consultation.time).bookingId == id))));
+    }
+
+    // Customer picks a new consultation slot after the admin asked them to.
+    function rescheduleUpdate(id) {
+      let o = resource.data;
+      let n = request.resource.data;
+      return o.paymentStatus == 'paid' && o.consultation.status == 'reschedule-requested'
+        && changed().hasOnly(['consultation', 'timeline'])
+        && n.consultation.keys().hasOnly(['date', 'time', 'status'])
+        && n.consultation.status == 'awaiting-confirmation'
+        && timelineAppended(o, n)
+        && slotAfter('consultation', n.consultation.date, n.consultation.time).bookingId == id;
+    }
+
+    // Customer books a delivery slot once the admin has enabled delivery.
+    function deliveryUpdate(id) {
+      let o = resource.data;
+      let n = request.resource.data;
+      return o.paymentStatus == 'paid' && o.delivery.enabled == true && !('date' in o.delivery)
+        && changed().hasOnly(['delivery', 'stage', 'timeline'])
+        && n.delivery.keys().hasOnly(['enabled', 'date', 'time', 'address'])
+        && n.delivery.enabled == true
+        && n.delivery.address is string && n.delivery.address.size() <= 400
+        && n.stage == 'delivery-scheduled'
+        && timelineAppended(o, n)
+        && slotAfter('delivery', n.delivery.date, n.delivery.time).bookingId == id;
+    }
 
     match /bookings/{id} {
       allow read: if signedIn() && (resource.data.uid == request.auth.uid || isAdmin());
-      allow write: if false;
+      allow create: if validNewBooking(id);
+      allow update: if (signedIn() && resource.data.uid == request.auth.uid
+                         && (payUpdate(id) || rescheduleUpdate(id) || deliveryUpdate(id)))
+                    || (isAdmin() && resource.data.paymentStatus == 'paid'
+                         && changed().hasOnly(['consultation', 'delivery', 'stage', 'timeline', 'reminders', 'paymentVerified']));
+      allow delete: if false;
     }
-    // Slot docs reveal only date/time/status, used to grey out taken slots.
-    match /slots/{id} {
+
+    // ---------- slots ----------
+    // Doc id = `${kind}_${date}_${time}`. Slot docs reveal only date/time/status, used to grey out taken slots.
+
+    function slotMatches(s, b) {
+      return s.kind == 'consultation'
+        ? b.consultation.date == s.date && b.consultation.time == s.time
+        : s.kind == 'delivery' && b.delivery.date == s.date && b.delivery.time == s.time;
+    }
+    function slotWriteOk(key) {
+      let s = request.resource.data;
+      let b = bookingAfter(s.bookingId);
+      return signedIn()
+        && s.keys().hasOnly(['kind', 'date', 'time', 'bookingId', 'status', 'holdUntil'])
+        && key == s.kind + '_' + s.date + '_' + s.time
+        && b.uid == request.auth.uid
+        && ((s.status == 'held' && b.paymentStatus == 'pending' && s.holdUntil == b.holdUntil)
+          || (s.status == 'booked' && b.paymentStatus == 'paid' && !('holdUntil' in s)))
+        && slotMatches(s, b);
+    }
+    function holdExpired(s) { return s.status == 'held' && s.holdUntil < now(); }
+
+    match /slots/{key} {
       allow read: if signedIn();
-      allow write: if false;
+      allow create: if slotWriteOk(key);
+      // Another booking can take a slot only once its hold has expired.
+      allow update: if slotWriteOk(key)
+                    && (resource.data.bookingId == request.resource.data.bookingId || holdExpired(resource.data));
+      // Admins free a slot when they ask the customer to reschedule.
+      allow delete: if isAdmin();
     }
+
+    // ---------- notifications ----------
+    // Written by the web app after each action. Recipients are limited to the booking's own customer
+    // or an admin, so the queue can't be used to message arbitrary people.
+
+    function notifyOk(m, allowPhone) {
+      let b = bookingAfter(m.bookingId);
+      return signedIn() && (b.uid == request.auth.uid || isAdmin())
+        && (m.to == b.customer.email
+          || (allowPhone && m.to == b.customer.phone)
+          || exists(/databases/$(database)/documents/admins/$(m.to)));
+    }
+
+    // Consumed by the "Trigger Email from Firestore" extension, which sends the email and records
+    // the delivery status on the doc.
+    match /mail/{id} {
+      allow read: if isAdmin();
+      allow create: if notifyOk(request.resource.data, false)
+        && request.resource.data.keys().hasOnly(['to', 'bookingId', 'message'])
+        && request.resource.data.message.keys().hasOnly(['subject', 'text']);
+    }
+
+    // Log of every notification. WhatsApp entries stay "pending" until an admin sends them via wa.me.
     match /outbox/{id} {
       allow read: if isAdmin();
-      allow write: if false;
+      allow create: if notifyOk(request.resource.data, true)
+        && request.resource.data.keys().hasOnly(['channel', 'to', 'subject', 'body', 'bookingId', 'at', 'status'])
+        && (request.resource.data.channel == 'email'
+          ? !('status' in request.resource.data)
+          : request.resource.data.channel == 'whatsapp' && request.resource.data.status == 'pending');
+      allow update: if isAdmin() && changed().hasOnly(['status']) && request.resource.data.status == 'sent';
     }
+
     // Admin access: create a document with the admin's email as its ID in the Firebase console.
     match /admins/{email} {
       allow read: if isAdmin();

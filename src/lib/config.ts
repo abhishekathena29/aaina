@@ -10,13 +10,17 @@ export const firebaseConfig = {
 /** Without Firebase keys the app runs on the local demo backend. */
 export const IS_DEMO = !firebaseConfig.apiKey
 
-export const FUNCTIONS_REGION = (env.VITE_FUNCTIONS_REGION as string | undefined) || 'asia-south1'
+/** Razorpay key id (public). The key secret is never needed in this app. */
+export const RAZORPAY_KEY_ID = (env.VITE_RAZORPAY_KEY_ID as string | undefined) || ''
 
-/** Used only to show/hide the admin console in the UI; real enforcement lives in Firestore rules + Functions. */
+/** Used only to show/hide the admin console in the UI; real enforcement lives in firestore.rules. */
 export const ADMIN_EMAILS = ((env.VITE_ADMIN_EMAILS as string | undefined) || (IS_DEMO ? 'admin@aaina.demo' : ''))
   .split(',')
   .map((e) => e.trim().toLowerCase())
   .filter(Boolean)
+
+/** Receives "new booking" emails. Must also exist as a document in the Firestore `admins` collection. */
+export const ADMIN_NOTIFY_EMAIL = (env.VITE_ADMIN_NOTIFY_EMAIL as string | undefined) || ADMIN_EMAILS[0] || ''
 
 export const APP_URL = (env.VITE_APP_URL as string | undefined) || window.location.origin
 

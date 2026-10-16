@@ -9,13 +9,16 @@ import {
   Mail,
   MessageCircle,
   Search,
+  Send,
+  ShieldAlert,
+  ShieldCheck,
   Truck,
 } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { Navbar, PageLoader, RequireAuth } from '../components/Layout'
 import { useAuth, useBackend } from '../lib/app-context'
-import { IS_DEMO } from '../lib/config'
+import { APP_URL, IS_DEMO } from '../lib/config'
 import {
   PRODUCTS,
   STAGES,
@@ -26,7 +29,8 @@ import {
   nowIST,
   type ProductId,
 } from '../shared/catalog'
-import type { AdminAction, Booking, OutboxMessage } from '../shared/types'
+import { messages as copy } from '../shared/messages'
+import type { AdminAction, Booking, OutboxMessage, Slot } from '../shared/types'
 import { StatusBadge } from './Orders'
 
 const CONFIRM_WITHIN_MS = 30 * 60_000
@@ -62,13 +66,46 @@ function AdminGate() {
   return <Console />
 }
 
-type Tab = 'attention' | 'orders' | 'schedule' | 'log'
+type Tab = 'attention' | 'whatsapp' | 'orders' | 'schedule' | 'log'
 
 /** When the booking (re-)entered the awaiting-confirmation state. */
 const awaitingSince = (b: Booking) =>
   [...b.timeline].reverse().find((t) => t.stage === 'awaiting-confirmation')?.at ?? b.paidAt ?? b.createdAt
 
 const needsConfirmation = (b: Booking) => b.consultation?.status === 'awaiting-confirmation'
+
+/** Normalise an Indian/international number to WhatsApp's digits-only format. */
+function waNumber(phone: string): string {
+  const digits = phone.replace(/\D/g, '')
+  return digits.length === 10 ? '91' + digits : digits.replace(/^0+/, '')
+}
+
+const waLink = (phone: string, text?: string) =>
+  `https://wa.me/${waNumber(phone)}` + (text ? `?text=${encodeURIComponent(text)}` : '')
+
+const razorpayPaymentUrl = (paymentId: string) => `https://dashboard.razorpay.com/app/payments/${paymentId}`
+
+interface DueReminder {
+  booking: Booking
+  kind: 'consultation' | 'delivery'
+  body: string
+}
+
+/** Confirmed consultations and scheduled deliveries in the next 24h that haven't had a reminder. */
+function dueReminders(bookings: Booking[], now: number): DueReminder[] {
+  const within24h = (s: Slot) => {
+    const at = Date.parse(`${s.date}T${s.time}:00+05:30`)
+    return at > now && at - now <= 24 * 3_600_000
+  }
+  const out: DueReminder[] = []
+  for (const b of bookings) {
+    if (b.consultation?.status === 'confirmed' && !b.reminders?.consultation && within24h(b.consultation))
+      out.push({ booking: b, kind: 'consultation', body: copy.reminder(b, 'consultation', APP_URL).body })
+    if (b.stage === 'delivery-scheduled' && b.delivery?.date && !b.reminders?.delivery && within24h({ date: b.delivery.date, time: b.delivery.time! }))
+      out.push({ booking: b, kind: 'delivery', body: copy.reminder(b, 'delivery', APP_URL).body })
+  }
+  return out
+}
 
 function useNow(ms = 1000) {
   const [now, setNow] = useState(() => Date.now())
@@ -130,6 +167,9 @@ function Console() {
   }, [toasts])
 
   const pending = bookings?.filter(needsConfirmation).length ?? 0
+  const minuteNow = useNow(60_000)
+  const reminders = useMemo(() => dueReminders(bookings ?? [], minuteNow), [bookings, minuteNow])
+  const toSend = outbox.filter((m) => m.channel === 'whatsapp' && m.status === 'pending').length + reminders.length
   useEffect(() => {
     document.title = pending ? `(${pending}) Admin · Aaina` : 'Admin · Aaina'
     return () => {
@@ -182,6 +222,7 @@ function Console() {
             {(
               [
                 ['attention', `Needs confirmation${pending ? ` (${pending})` : ''}`],
+                ['whatsapp', `WhatsApp to send${toSend ? ` (${toSend})` : ''}`],
                 ['orders', 'All orders'],
                 ['schedule', 'Schedule'],
                 ['log', 'Notification log'],
@@ -194,6 +235,7 @@ function Console() {
           </div>
 
           {tab === 'attention' && <Attention bookings={bookings} />}
+          {tab === 'whatsapp' && <WhatsAppQueue messages={outbox} reminders={reminders} />}
           {tab === 'orders' && <AllOrders bookings={bookings} />}
           {tab === 'schedule' && <Schedule bookings={bookings} />}
           {tab === 'log' && <Log messages={outbox} />}
@@ -282,12 +324,13 @@ function ConfirmCard({ booking: b }: { booking: Booking }) {
         <p className="muted small">
           {PRODUCTS[b.product].name} · {b.id} · {formatINR(b.amount)} paid
         </p>
+        <PaymentCheck booking={b} />
         <p className="slot-text">
           {formatDate(c.date)}, {formatTime(c.time)}
         </p>
         <p className="small">
           <a href={`mailto:${b.customer.email}`}>{b.customer.email}</a> ·{' '}
-          <a href={`https://wa.me/${b.customer.phone.replace(/\D/g, '')}`} target="_blank" rel="noreferrer">
+          <a href={waLink(b.customer.phone)} target="_blank" rel="noreferrer">
             {b.customer.phone}
           </a>
         </p>
@@ -318,6 +361,91 @@ function ConfirmCard({ booking: b }: { booking: Booking }) {
         </div>
       )}
       {error && <p className="form-error">{error}</p>}
+    </div>
+  )
+}
+
+/**
+ * Without a server, payments can't be verified automatically: check the payment in the Razorpay
+ * dashboard (right amount and booking id in its notes, captured) before marking it verified.
+ */
+function PaymentCheck({ booking: b }: { booking: Booking }) {
+  const { busy, error, run } = useAction(b.id)
+  if (b.paymentVerified)
+    return (
+      <p className="small">
+        <span className="badge badge-done">
+          <ShieldCheck size={13} /> Payment verified
+        </span>{' '}
+        <small className="muted">{b.paymentRef}</small>
+      </p>
+    )
+  return (
+    <div className="small">
+      <span className="badge badge-warn">
+        <ShieldAlert size={13} /> Payment not verified
+      </span>{' '}
+      {b.paymentRef && !IS_DEMO ? (
+        <a href={razorpayPaymentUrl(b.paymentRef)} target="_blank" rel="noreferrer">
+          Check {b.paymentRef} in Razorpay
+        </a>
+      ) : (
+        <small className="muted">{b.paymentRef}</small>
+      )}{' '}
+      <button className="btn btn-ghost-dark btn-sm" disabled={busy} onClick={() => run({ type: 'verify-payment' })}>
+        Mark payment verified
+      </button>
+      {error && <p className="form-error">{error}</p>}
+    </div>
+  )
+}
+
+/** WhatsApp messages can't be sent from the browser automatically, so the admin sends each one via wa.me. */
+function WhatsAppQueue({ messages, reminders }: { messages: OutboxMessage[]; reminders: DueReminder[] }) {
+  const backend = useBackend()
+  const queued = messages.filter((m) => m.channel === 'whatsapp' && m.status === 'pending').reverse()
+  if (!queued.length && !reminders.length)
+    return (
+      <div className="card empty">
+        <Check size={28} />
+        <h3>Nothing to send</h3>
+        <p className="muted">WhatsApp updates and 24-hour reminders will appear here, ready to send in one tap.</p>
+      </div>
+    )
+  const item = (key: string, title: string, to: string, body: string, onSent: () => Promise<void>) => (
+    <div key={key} className="card log__item">
+      <span className="log__icon log__icon--whatsapp">
+        <MessageCircle size={16} />
+      </span>
+      <div>
+        <p className="small muted">
+          {title} to <strong>{to}</strong>
+        </p>
+        <p className="log__body">{body}</p>
+        <a
+          className="btn btn-gold btn-sm"
+          href={waLink(to, body)}
+          target="_blank"
+          rel="noreferrer"
+          onClick={() => void onSent().catch((e) => alert((e as Error).message))}
+        >
+          <Send size={15} /> Send on WhatsApp
+        </a>
+      </div>
+    </div>
+  )
+  return (
+    <div className="log">
+      {reminders.map((r) =>
+        item(r.booking.id + r.kind, `Reminder (${r.kind}) · ${r.booking.customer.name}`, r.booking.customer.phone, r.body, () =>
+          backend.markReminderSent(r.booking.id, r.kind),
+        ),
+      )}
+      {queued.map((m) =>
+        item(m.id, `${m.subject ?? 'Update'} · ${new Date(m.at).toLocaleString('en-IN')}`, m.to, m.body, () =>
+          backend.markWhatsAppSent(m.id),
+        ),
+      )}
     </div>
   )
 }
@@ -391,7 +519,7 @@ function OrderPanel({ booking: b }: { booking: Booking }) {
             <br />
             <a href={`mailto:${b.customer.email}`}>{b.customer.email}</a>
             <br />
-            <a href={`https://wa.me/${b.customer.phone.replace(/\D/g, '')}`} target="_blank" rel="noreferrer">
+            <a href={waLink(b.customer.phone)} target="_blank" rel="noreferrer">
               {b.customer.phone}
             </a>
           </p>
@@ -400,9 +528,8 @@ function OrderPanel({ booking: b }: { booking: Booking }) {
           <span>Payment</span>
           <p>
             {formatINR(b.amount)} · {new Date(b.paidAt!).toLocaleString('en-IN')}
-            <br />
-            <small className="muted">{b.paymentRef}</small>
           </p>
+          <PaymentCheck booking={b} />
         </div>
         {c && (
           <div>
@@ -465,7 +592,7 @@ function OrderPanel({ booking: b }: { booking: Booking }) {
             if (await run({ type: 'set-stage', stage, note })) setNote('')
           }}
         >
-          <MessageCircle size={15} /> Update & send WhatsApp
+          <MessageCircle size={15} /> Update & queue WhatsApp
         </button>
       </div>
       {error && <p className="form-error">{error}</p>}
@@ -524,6 +651,7 @@ function Log({ messages }: { messages: OutboxMessage[] }) {
           <div>
             <p className="small muted">
               {m.channel === 'email' ? 'Email' : 'WhatsApp'} to <strong>{m.to}</strong> · {new Date(m.at).toLocaleString('en-IN')} · {m.bookingId}
+              {m.status === 'pending' && ' · not sent yet'}
             </p>
             {m.subject && <h4>{m.subject}</h4>}
             <p className="log__body">{m.body}</p>

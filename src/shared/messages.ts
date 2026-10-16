@@ -1,4 +1,4 @@
-// Notification copy shared by the demo backend and Cloud Functions.
+// Notification copy shared by the demo and Firebase backends.
 import { PRODUCTS, formatDate, formatINR, formatTime, slotEnd, stageLabel } from './catalog'
 import type { Booking } from './types'
 

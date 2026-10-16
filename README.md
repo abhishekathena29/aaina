@@ -2,7 +2,9 @@
 
 Booking platform for consultations, custom wigs made from the customer's own hair, and ready-made natural hair wigs.
 
-**Stack:** React + Vite + TypeScript · Firebase (Google Auth, Firestore, Cloud Functions, Hosting) · Razorpay · SMTP email · WhatsApp Cloud API
+**Stack:** React + Vite + TypeScript · Firebase (Google Auth, Firestore, Hosting, Trigger Email extension) · Razorpay Checkout · WhatsApp via wa.me
+
+There is **no server code to host**. The web app writes to Firestore directly, and `firestore.rules` validates every write.
 
 ## Run it locally (demo mode)
 
@@ -24,9 +26,11 @@ With no Firebase keys in `.env`, the app runs in **demo mode**. Everything is st
 | `/checkout/:id` | Payment (Razorpay). The slot is held for 15 minutes |
 | `/orders`, `/orders/:id` | Order tracking timeline, consultation status, reschedule, and **delivery slot booking** (15-minute slots, 11 AM–7 PM) once the admin enables it |
 | `/resources` | Wig do's and don'ts, how-to videos, FAQ |
-| `/admin` | New-booking alerts (sound, tab badge, desktop notification), a 30-minute confirmation timer, confirm or reschedule, order status updates (these send WhatsApp messages), enable delivery, schedule, and the notification log |
+| `/admin` | New-booking alerts (sound, tab badge, desktop notification), a 30-minute confirmation timer, payment verification, confirm or reschedule, order status updates, enable delivery, **WhatsApp to send** queue (one-tap sending, 24-hour reminders), schedule, and the notification log |
 
 ## Notification flow
+
+Emails are sent automatically by the Firebase **Trigger Email** extension. WhatsApp messages can't be sent from a browser without exposing an API token, so they're queued in **Admin → WhatsApp to send**: one tap opens WhatsApp with the message filled in.
 
 | Event | Customer | Admin |
 |---|---|---|
@@ -36,35 +40,38 @@ With no Firebase keys in `.env`, the app runs in **demo mode**. Everything is st
 | Admin updates the order status | WhatsApp update | — |
 | Admin enables delivery (wig ready) | **Email + WhatsApp with a delivery booking link** | — |
 | Customer books delivery | Email + WhatsApp | Email |
-| 24 hours before a consultation or delivery | WhatsApp reminder (scheduled function) | — |
+| 24 hours before a consultation or delivery | WhatsApp reminder (appears in the admin's WhatsApp queue) | — |
+
+## Payments without a server
+
+Razorpay order creation and signature checks need the key secret, which can't live in the browser. So the app opens Razorpay Checkout **without an order** and saves the returned payment ID (`pay_…`) on the booking. The Firestore rules make sure prices are correct and that a customer can only change their own booking from pending to paid. The rules **can't** prove the payment really happened, though, so:
+
+- Every paid booking shows **Payment not verified** in the admin console, with a link to that payment in the Razorpay dashboard.
+- Check the amount, check that the booking ID matches the payment's notes, and **capture** the payment if it shows as *Authorized*. Then click **Mark payment verified**.
+- Do this before confirming a slot or starting work on a wig.
+
+Razorpay usually only auto-captures payments made through Orders. Check your account's capture settings. Uncaptured payments are refunded automatically after a few days.
 
 ## Going live
 
-1. **Firebase project.** Create one, enable **Authentication → Google**, **Firestore**, and the **Blaze** plan (Functions needs it). Add a web app and copy its config into `.env` (see `.env.example`).
-2. **Admins.** In Firestore, create the document `admins/<admin-email>` (it can be empty). Also list the same emails in `VITE_ADMIN_EMAILS`.
-3. **Razorpay.** Get API keys. Add a webhook pointing to `https://asia-south1-<project>.cloudfunctions.net/razorpayWebhook` for the event `payment.captured`.
-4. **WhatsApp Cloud API** (Meta Business). Create a *utility* template named `aaina_update` with the body `{{1}}`, or set your own with `WHATSAPP_TEMPLATE`. Get the phone number ID and a permanent access token.
-5. **Email.** Use any SMTP account. For Gmail or Workspace, use an app password: `smtps://you@domain.com:APP_PASSWORD@smtp.gmail.com:465`.
+1. **Firebase project.** Create one and enable **Authentication → Google** and **Firestore**. Add a web app and copy its config into `.env` (see `.env.example`).
+2. **Admins.** In Firestore, create the document `admins/<admin-email>` (it can be empty) for each admin. List the same emails in `VITE_ADMIN_EMAILS`. Set `VITE_ADMIN_NOTIFY_EMAIL` to an email that has an `admins` document, otherwise the rules reject "new booking" emails.
+3. **Razorpay.** Put your **Key ID** in `VITE_RAZORPAY_KEY_ID`. The key secret isn't used anywhere.
+4. **Email.** Install the **Trigger Email from Firestore** extension (Firebase console → Extensions). Set the collection to `mail` and give it an SMTP URI, e.g. `smtps://you@domain.com:APP_PASSWORD@smtp.gmail.com:465`, plus a default FROM address. Extensions need the Blaze plan, but you don't write or deploy any function code. Skip this step and emails stay queued in `mail` (everything else still works).
+5. **WhatsApp.** No setup. Admins send queued messages from **Admin → WhatsApp to send** using the business WhatsApp on their phone or WhatsApp Web.
 6. **Deploy:**
 
 ```bash
 npm i -g firebase-tools && firebase login && firebase use <project-id>
-cd functions && npm install && cd ..
-firebase functions:secrets:set RAZORPAY_KEY_SECRET
-firebase functions:secrets:set RAZORPAY_WEBHOOK_SECRET
-firebase functions:secrets:set SMTP_URL
-firebase functions:secrets:set WHATSAPP_TOKEN
-# Non-secret params (RAZORPAY_KEY_ID, WHATSAPP_PHONE_NUMBER_ID, ADMIN_NOTIFY_EMAIL, APP_URL, MAIL_FROM)
-# are prompted for on first deploy and saved to functions/.env.<project-id>
-npm run build && firebase deploy
+npm run build && firebase deploy   # hosting + firestore rules/indexes
 ```
 
 ## Where things live
 
-- `src/shared/`: pricing, slot rules, order stages, message copy and state transitions. **Both** the web app and the Cloud Functions use these files. `functions` copies them in on build (`npm run sync-shared`).
+- `src/shared/`: pricing, slot rules, order stages, message copy and state transitions, used by both backends. If you change prices, update them in `firestore.rules` too.
 - `src/content/site.ts`: editable copy (do's and don'ts, videos, testimonials, team, FAQ). Add the YouTube IDs for the videos there.
 - `src/lib/backend/`: `demo.ts` (localStorage) and `firebase.ts` (production) implement the same interface.
-- `functions/src/`: secure server logic. Prices are always calculated on the server, payments are verified by Razorpay signature, and slots are claimed in transactions.
+- `firestore.rules`: the security layer. It checks prices and discount credits, slot claims (only after a hold expires), which fields each step may change, and notification recipients.
 
 ## Before launch
 

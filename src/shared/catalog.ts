@@ -1,5 +1,5 @@
-// Pure domain logic shared by the web app and Cloud Functions.
-// Keep this file dependency-free: `npm run sync-shared` copies it into functions/src/shared.
+// Pure domain logic shared by the web app's backends (demo and Firebase).
+// Keep this file dependency-free.
 
 export type ProductId = 'consultation' | 'complete-package' | 'wig-only' | 'natural-wig'
 
